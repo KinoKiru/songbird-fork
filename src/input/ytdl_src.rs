@@ -182,7 +182,7 @@ pub async fn ytdl_playlist(uri: impl AsRef<str>) -> Result<Vec<Input>> {
 }
 
 pub(crate) async fn _ytdl_playlist(uri: &str, pre_args: &[&str]) -> Result<Vec<Input>> {
-    let mut ytdl_args = vec![
+    let ytdl_args = vec![
         "--print-json",
         "-f",
         "webm[abr>0]/bestaudio/best",
@@ -265,3 +265,91 @@ pub(crate) async fn _ytdl_playlist(uri: &str, pre_args: &[&str]) -> Result<Vec<I
 }
 
 // TODO Add new command for only the metadata
+/// OWN MADE
+/// will allow you to search for the whole playlist instead of one song
+pub async fn ytdl_playlist_metadata(uri: impl AsRef<str>) -> Result<Vec<Input>> {
+    _ytdl_playlist_metadata(uri.as_ref(), &[]).await
+}
+
+pub(crate) async fn _ytdl_playlist_metadata(uri: &str, pre_args: &[&str]) -> Result<Vec<Input>> {
+    let ytdl_args = vec![
+        "--print-json",
+        "-f",
+        "webm[abr>0]/bestaudio/best",
+        "-R",
+        "--flat-playlist",
+        "infinite",
+        "--ignore-config",
+        "--no-warnings",
+        uri,
+        "-o",
+        "-",
+    ];
+
+    let ffmpeg_args = [
+        "-f",
+        "s16le",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        "-acodec",
+        "pcm_f32le",
+        "-",
+    ];
+
+    let mut youtube_dl = Command::new(YOUTUBE_DL_COMMAND)
+        .args(&ytdl_args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // This rigmarole is required due to the inner synchronous reading context.
+    let stderr = youtube_dl.stderr.take();
+    let (returned_stderr, value) = task::spawn_blocking(move || {
+        let mut s = stderr.unwrap();
+        let out: Result<Value> = {
+            let mut o_vec = vec![];
+            let mut serde_read = BufReader::new(s.by_ref());
+            // Newline...
+            if let Ok(len) = serde_read.read_until(0xA, &mut o_vec) {
+                serde_json::from_slice(&o_vec[..len]).map_err(|err| Error::Json {
+                    error: err,
+                    parsed_text: std::str::from_utf8(&o_vec).unwrap_or_default().to_string(),
+                })
+            } else {
+                Result::Err(Error::Metadata)
+            }
+        };
+
+        (s, out)
+    })
+    .await
+    .map_err(|_| Error::Metadata)?;
+
+    youtube_dl.stderr = Some(returned_stderr);
+
+    let taken_stdout = youtube_dl.stdout.take().ok_or(Error::Stdout)?;
+
+    let ffmpeg = Command::new("ffmpeg")
+        .args(pre_args)
+        .arg("-i")
+        .arg("-")
+        .args(&ffmpeg_args)
+        .stdin(taken_stdout)
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let metadata = Metadata::from_ytdl_output(value?);
+    trace!("ytdl metadata {:?}", metadata);
+
+    Ok(vec![Input::new(
+        true,
+        children_to_reader::<f32>(vec![youtube_dl, ffmpeg]),
+        Codec::FloatPcm,
+        Container::Raw,
+        Some(metadata),
+    )])
+}
